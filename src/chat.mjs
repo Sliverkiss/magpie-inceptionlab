@@ -11,7 +11,7 @@
 //    parse-failed / refused) and retried once before the client sees anything.
 
 import {
-  Client, UpstreamError, isTooLong,
+  UpstreamError,
   eventContent, eventReasoning,
   StreamTruncatedError, IdleTimeoutError,
 } from "./upstream.mjs";
@@ -22,10 +22,10 @@ import { buildManifest } from "./tools-manifest.mjs";
 import { Parser } from "./tools-parse.mjs";
 import {
   classifyNoCall, retryMessageTruncated, retryMessageParseFailed,
-  retryMessageRefusal, stripSwitchNote, RECOVERY_TRUNCATED, RECOVERY_PARSE_FAILED, RECOVERY_REFUSED,
+  retryMessageRefusal, retryMessageUndeclared, stripSwitchNote,
+  RECOVERY_TRUNCATED, RECOVERY_PARSE_FAILED, RECOVERY_REFUSED, RECOVERY_UNDECLARED,
 } from "./tools-recovery.mjs";
 import { newCallId } from "./tools-replay.mjs";
-import { buildModelMap } from "./models.mjs";
 import { randomId } from "./convert.mjs";
 
 let client = null;
@@ -76,7 +76,7 @@ async function plainChat(req, signal) {
   const ureq = buildChatRequest(hist, req.effort);
   if (!req.stream) return completeFromStream(ureq, req.model, signal);
   // client.chat is async: the promise must resolve before iterating.
-  return plainStreamResponse(await client.chat(ureq, { signal }), req.model);
+  return plainStreamResponse(await client.chat(ureq, { signal }), req.model, estimateRequestTokens(ureq));
 }
 
 // channel is a tiny push/pull adapter: a producer pump feeds frames, the
@@ -107,14 +107,16 @@ function channel() {
 // empty completion — or any failure before text — throws here, so the client
 // gets a real HTTP error status instead of a 200 with an empty SSE body. A
 // mid-stream failure after text rides the in-stream error frame.
-async function plainStreamResponse(it, model) {
+async function plainStreamResponse(it, model, promptTokens = 0) {
   const ch = channel();
   const id = randomId("chatcmpl");
   const created = Math.floor(Date.now() / 1000);
-  const push = (delta, finish) => {
+  let completionChars = 0;
+  const push = (delta, finish, usage) => {
     ch.push(`data: ${JSON.stringify({
       id, object: "chat.completion.chunk", created, model,
       choices: [{ index: 0, delta, finish_reason: finish ?? null }],
+      ...(usage ? { usage } : {}),
     })}\n\n`);
   };
 
@@ -134,21 +136,30 @@ async function plainStreamResponse(it, model) {
         if (text && !sawText) {
           sawText = true;
           push({ role: "assistant" });
-          for (const b of buffered) push({ reasoning_content: b });
+          for (const b of buffered) {
+            completionChars += countChars(b);
+            push({ reasoning_content: b });
+          }
           buffered.length = 0;
           ready({ ok: true });
         }
         if (reasoning) {
-          if (sawText) push({ reasoning_content: reasoning });
-          else buffered.push(reasoning);
+          if (sawText) {
+            completionChars += countChars(reasoning);
+            push({ reasoning_content: reasoning });
+          } else buffered.push(reasoning);
         }
-        if (text) push({ content: text });
+        if (text) {
+          completionChars += countChars(text);
+          push({ content: text });
+        }
       }
       if (!sawText) {
         ready({ ok: false, error: new EmptyCompletionError() });
         return;
       }
-      push({ annotations: cites.length ? cites : undefined }, "stop");
+      const usage = usageOf(promptTokens, tokensOf(completionChars));
+      push({ annotations: cites.length ? cites : undefined }, "stop", usage);
       ch.push("data: [DONE]\n\n");
       ch.end();
     } catch (e) {
@@ -204,29 +215,32 @@ async function toolsChat(req, signal) {
   };
 
   const build = (h) => buildToolChatRequest(h, req.effort, fullManifest);
-  let res = await readRound(build(hist));
+  let ureq = build(hist);
+  let res = await readRound(ureq);
 
   const empty = () => res.content === "" && res.calls.length === 0;
   const kindOf = () => {
     if (res.calls.length > 0) return null;
     if (empty()) return "empty";
-    const kind = classifyNoCall(res.content);
+    const kind = classifyNoCall(res.content, fullManifest.declared);
     return kind === "clean" ? null : kind; // clean prose is a legal terminal
   };
 
   let kind = kindOf();
   if (kind) {
     // One bounded retry; whatever it returns is passed through verbatim.
-    const retryReq = retryRequestFor(build(hist), res, kind);
+    const retryReq = retryRequestFor(ureq, res, kind);
     try {
       res = await readRound(retryReq);
+      ureq = retryReq; // usage is computed against the request that answered
     } catch {
       // original round passes through verbatim
     }
   }
   if (empty()) throw new EmptyCompletionError();
 
-  return respondRound(res, req.model, req.stream);
+  const usage = usageOf(estimateRequestTokens(ureq), estimateCompletionTokens(res));
+  return respondRound(res, req.model, req.stream, usage);
 }
 
 // retryRequestFor builds the upstream request a recovery retry re-asks with:
@@ -238,6 +252,7 @@ function retryRequestFor(ureq, res, kind) {
   let message;
   if (kind === RECOVERY_TRUNCATED) message = retryMessageTruncated(res.content);
   else if (kind === RECOVERY_PARSE_FAILED) message = retryMessageParseFailed(res.content);
+  else if (kind === RECOVERY_UNDECLARED) message = retryMessageUndeclared();
   else if (kind === RECOVERY_REFUSED) message = retryMessageRefusal();
   else return ureq;
 
@@ -250,7 +265,10 @@ function retryRequestFor(ureq, res, kind) {
       msgs[i] = { ...m, parts };
     }
   }
-  if (res.content !== "" && kind !== RECOVERY_REFUSED) {
+  // Refused and undeclared rounds are canned/hallucinated shapes the model
+  // must drop, not outputs it must repair — replaying them would only
+  // reinforce the pattern the retry exists to break.
+  if (res.content !== "" && kind !== RECOVERY_REFUSED && kind !== RECOVERY_UNDECLARED) {
     msgs.push({ parts: [{ type: "text", text: res.content, state: "done" }], id: randomId("m"), role: "assistant" });
   }
   msgs.push({ parts: [{ type: "text", text: message }], id: randomId("m"), role: "user" });
@@ -260,7 +278,7 @@ function retryRequestFor(ureq, res, kind) {
 // respondRound writes an already-consumed round: JSON completion or SSE
 // replay (role frame, reasoning, content, tool_calls deltas, finish with
 // annotations, [DONE]). finish_reason is tool_calls when calls remain.
-async function respondRound(res, model, stream) {
+async function respondRound(res, model, stream, usage) {
   if (!stream) {
     return new Response(JSON.stringify({
       id: randomId("chatcmpl"),
@@ -278,14 +296,16 @@ async function respondRound(res, model, stream) {
         },
         finish_reason: res.calls.length ? "tool_calls" : "stop",
       }],
+      usage,
     }), { status: 200, headers: { "content-type": "application/json" } });
   }
 
   const id = randomId("chatcmpl");
   const created = Math.floor(Date.now() / 1000);
-  const push = (delta, finish) => `data: ${JSON.stringify({
+  const push = (delta, finish, u) => `data: ${JSON.stringify({
     id, object: "chat.completion.chunk", created, model,
     choices: [{ index: 0, delta, finish_reason: finish ?? null }],
+    ...(u ? { usage: u } : {}),
   })}\n\n`;
 
   const frames = [];
@@ -296,7 +316,7 @@ async function respondRound(res, model, stream) {
     frames.push(push({ tool_calls: [{ index: i, id: newCallId(), type: "function", function: { name: c.name, arguments: c.arguments } }] }));
   });
   const finish = res.calls.length ? "tool_calls" : "stop";
-  frames.push(push({ annotations: res.cites.length ? res.cites : undefined }, finish));
+  frames.push(push({ annotations: res.cites.length ? res.cites : undefined }, finish, usage));
   frames.push("data: [DONE]\n\n");
 
   return new Response(frames.join(""), {
@@ -326,6 +346,10 @@ async function completeFromStream(ureq, model, signal) {
     throw e;
   }
   if (content === "") throw new EmptyCompletionError();
+  const usage = usageOf(
+    estimateRequestTokens(ureq),
+    tokensOf(countChars(content) + countChars(reasoning)),
+  );
   return new Response(JSON.stringify({
     id: randomId("chatcmpl"),
     object: "chat.completion",
@@ -341,7 +365,57 @@ async function completeFromStream(ureq, model, signal) {
       },
       finish_reason: "stop",
     }],
+    usage,
   }), { status: 200, headers: { "content-type": "application/json" } });
+}
+
+// ------------------------------------------------------------- usage estimate
+
+// estimateUsage approximates OpenAI token accounting. Mercury emits no usage
+// events, so — like every other reverse proxy for a usage-less upstream — we
+// estimate: ~4 chars per token over Unicode code points (UTF-16 .length
+// overcounts CJK ~2x). Good enough for magpie's quota display and per-key
+// rate math; not a billing figure.
+const CHARS_PER_TOKEN = 4;
+
+// countChars counts Unicode code points (UTF-16 .length overcounts CJK ~2x).
+function countChars(s) {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    n++;
+    const c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+      const d = s.charCodeAt(i + 1);
+      if (d >= 0xdc00 && d <= 0xdfff) i++; // surrogate pair = one code point
+    }
+  }
+  return n;
+}
+
+const tokensOf = (chars) => Math.ceil(chars / CHARS_PER_TOKEN);
+
+function estimateRequestTokens(ureq) {
+  let chars = 0;
+  for (const m of ureq.messages) {
+    for (const p of m.parts ?? []) {
+      if (typeof p.text === "string") chars += countChars(p.text);
+    }
+  }
+  return tokensOf(chars);
+}
+
+function estimateCompletionTokens(res) {
+  let chars = countChars(res.content) + countChars(res.reasoning);
+  for (const c of res.calls ?? []) chars += countChars(c.arguments) + countChars(c.name);
+  return tokensOf(chars);
+}
+
+function usageOf(promptTokens, completionTokens) {
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: promptTokens + completionTokens,
+  };
 }
 
 // observeCitation collects source-url events into OpenAI citation

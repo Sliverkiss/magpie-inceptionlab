@@ -136,15 +136,13 @@ export async function* streamEvents(body, opts = {}) {
 // Client is the one upstream handle: clearance + token pool + the shared
 // request path with challenge replay and token retry.
 export class Client {
-  constructor({ fetchImpl = fetch, clearanceSize = 2, poolMin = 1, poolMax = 2, logf = () => {} } = {}) {
+  constructor({ fetchImpl = fetch, clearanceSize = 2, poolMin = 1, poolMax = 2 } = {}) {
     this.fetchImpl = fetchImpl;
-    this.logf = logf;
-    this.clearance = new Clearance({ size: clearanceSize, fetchImpl, logf });
+    this.clearance = new Clearance({ size: clearanceSize, fetchImpl });
     this.pool = new TokenPool({
       min: poolMin,
       max: poolMax,
       fetchToken: () => this.fetchSession(),
-      logf,
     });
     // Request-driven warmup: no background loop against the edge. The first
     // chat solves inline via ensure(); each successful request tops the ring
@@ -208,13 +206,11 @@ export class Client {
     await this.clearance.ensure();
     let { resp, cookie } = await this.do(method, path, body, opts);
     if (resp.status === 429 && !isChallenge(resp)) {
-      this.logf("upstream: plain 429; retiring slot");
       this.clearance.retire(cookie);
       return resp;
     }
     if (!isChallenge(resp)) return resp;
     await resp.body?.cancel();
-    this.logf(`upstream: checkpoint challenged ${method} ${path}; retiring the slot and replaying once`);
     this.clearance.retire(cookie);
     await this.clearance.ensure();
     ({ resp } = await this.do(method, path, body, opts));
@@ -276,14 +272,7 @@ export class Client {
         // never poisons a token for an upstream fault); surface as-is.
         throw e;
       }
-      return streamEvents(resp.body, {
-        signal,
-        onMalformed: (l) => this.logf(`upstream: skipping malformed SSE line: ${String(l).slice(0, 200)}`),
-      });
+      return streamEvents(resp.body, { signal });
     }
-  }
-
-  stats() {
-    return { clearance: this.clearance.stats(), pool: this.pool.stats() };
   }
 }

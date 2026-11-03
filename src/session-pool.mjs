@@ -8,10 +8,11 @@ import { ClearanceError } from "./clearance.mjs";
 const TTL = 30 * 60_000;
 
 // Token shape bounds: {unix_ts}.{32 hex}.{64 hex} (10-digit unix until 2286).
-const NONCE_HEX = 32;
-const SIGN_HEX = 64;
-const MIN_TOKEN_LEN = 10 + 1 + NONCE_HEX + 1 + SIGN_HEX;
-const MAX_TOKEN_LEN = 11 + 1 + NONCE_HEX + 1 + SIGN_HEX;
+const TS_RE = /^\d{10,11}$/;
+const NONCE_RE = /^[0-9a-f]{32}$/;
+const SIGN_RE = /^[0-9a-f]{64}$/;
+const MIN_TOKEN_LEN = 10 + 1 + 32 + 1 + 64;
+const MAX_TOKEN_LEN = 11 + 1 + 32 + 1 + 64;
 
 // validateToken checks the documented shape (pool.go ValidateToken).
 export function validateToken(token) {
@@ -19,9 +20,9 @@ export function validateToken(token) {
   const parts = token.split(".");
   if (parts.length !== 3) return false;
   const [ts, nonce, sign] = parts;
-  if (!/^\d{10,11}$/.test(ts)) return false;
-  if (!new RegExp(`^[0-9a-f]{${NONCE_HEX}}$`).test(nonce)) return false;
-  if (!new RegExp(`^[0-9a-f]{${SIGN_HEX}}$`).test(sign)) return false;
+  if (!TS_RE.test(ts)) return false;
+  if (!NONCE_RE.test(nonce)) return false;
+  if (!SIGN_RE.test(sign)) return false;
   return true;
 }
 
@@ -45,15 +46,20 @@ export class TokenPool {
     return { size: this.tokens.length, live, expired, min: this.min, max: this.max };
   }
 
-  // get returns a live token, topping the pool up to min when below it. All
-  // callers awaiting a fetch share one inflight handshake.
+  // get returns a live token, keeping the pool at min..max: below min it
+  // blocks on one shared fill; between min and max it tops up without
+  // blocking, so losing one token restores the two-slot rotation (a challenged
+  // or rate-limited slot still leaves a live spare).
   async get() {
     const t = this.now();
     this.tokens = this.tokens.filter((tok) => t - tok.created < this.ttl);
-    if (this.tokens.length > 0) return this.pick();
-    if (this.tokens.length < this.min) await this.fill();
-    if (this.tokens.length > 0) return this.pick();
-    throw new ClearanceError("pool: no session token available");
+    if (this.tokens.length <= 0) {
+      if (this.tokens.length < this.min) await this.fill();
+      if (this.tokens.length > 0) return this.pick();
+      throw new ClearanceError("pool: no session token available");
+    }
+    if (this.tokens.length < this.max) this.fill().catch(() => {});
+    return this.pick();
   }
 
   pick() {
@@ -63,7 +69,9 @@ export class TokenPool {
     return tok.value;
   }
 
-  // fill runs one shared fetch up to max.
+  // fill runs one shared fetch up to max. Each fetched token enters the pool
+  // as soon as it validates: a later failure keeps the earlier ones instead of
+  // discarding a half-successful handshake.
   async fill() {
     if (this.fetchInflight) return this.fetchInflight;
     this.fetchInflight = (async () => {

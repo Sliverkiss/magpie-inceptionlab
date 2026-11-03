@@ -20,6 +20,9 @@ const PARAM_END = '</parameter>';
 // cannot grow the buffer without limit.
 const MAX_BLOCK_CHARS = 64 << 10;
 
+// Hoisted: holdback runs per SSE delta on the hot path — no per-call array.
+const START_MARKERS = [CALL_START, BLOCK_START];
+
 export class Parser {
   constructor(declared = []) {
     this.declared = new Set(declared);
@@ -86,7 +89,11 @@ export class Parser {
         return out;
       }
 
-      const end = this.buf.indexOf(this.closer);
+      // Find the closer, skipping matches inside a JSON string literal: a
+      // parameter value may legitimately contain the closer text (the model
+      // writing about XML closing tags), and cutting there corrupts both the
+      // call and the surrounding prose.
+      const end = this.#findCloser();
       if (end < 0) {
         if (final) {
           out += this.open + this.buf;
@@ -111,6 +118,29 @@ export class Parser {
   }
 
   // <tool_call>{...}</tool_call>
+  // findCloser locates the closer of the open block, skipping occurrences
+  // inside a JSON string literal (inString/escaped state machine, same rules
+  // as tools-recovery.unbalancedJSONTail). Returns -1 while the closer has not
+  // arrived. Non-JSON blocks are searched plainly: their bodies never contain
+  // the closer as data.
+  #findCloser() {
+    if (this.open !== CALL_START) return this.buf.indexOf(this.closer);
+    let inString = false;
+    let escaped = false;
+    for (let i = 0; i < this.buf.length; i++) {
+      const r = this.buf[i];
+      if (escaped) { escaped = false; continue; }
+      if (inString) {
+        if (r === '\\') escaped = true;
+        else if (r === '"') inString = false;
+        continue;
+      }
+      if (r === '"') { inString = true; continue; }
+      if (r === this.closer[0] && this.buf.startsWith(this.closer, i)) return i;
+    }
+    return -1;
+  }
+
   #parseJSONCall(body) {
     body = trimFence(body.trim());
     let raw;
@@ -209,7 +239,7 @@ function trimFence(s) {
 // whole marker: a complete marker is found above).
 function holdback(buf) {
   let best = 0;
-  for (const m of [CALL_START, BLOCK_START]) {
+  for (const m of START_MARKERS) {
     const max = Math.min(m.length - 1, buf.length);
     for (let k = max; k > best; k--) {
       if (buf.endsWith(m.slice(0, k))) {

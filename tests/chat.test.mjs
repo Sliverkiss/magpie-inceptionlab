@@ -49,9 +49,13 @@ test("plain non-stream: aggregates content and reasoning", async () => {
   assert.equal(j.choices[0].message.content, "Hi there");
   assert.equal(j.choices[0].message.reasoning_content, "thinking...");
   assert.equal(j.choices[0].finish_reason, "stop");
+  // Mercury has no usage events; the gateway estimates ~4 chars per token.
+  assert.equal(j.usage.prompt_tokens, 2); // "hello" = 5 chars → ceil(5/4)
+  assert.equal(j.usage.completion_tokens, 5); // "thinking...Hi there" = 18 chars
+  assert.equal(j.usage.total_tokens, 7);
 });
 
-test("plain stream: role frame precedes content; finish carries [DONE]", async () => {
+test("plain stream: role frame precedes content; finish carries [DONE] and usage", async () => {
   setClient(mockClient({
     "hello": [text("Hello"), text(" world")],
   }));
@@ -65,6 +69,9 @@ test("plain stream: role frame precedes content; finish carries [DONE]", async (
   assert.deepEqual(frames[0].choices[0].delta, { role: "assistant" });
   const content = frames.slice(1, -1).map((f) => f.choices[0].delta.content).join("");
   assert.equal(content, "Hello world");
+  const finish = frames.at(-2);
+  assert.equal(finish.choices[0].finish_reason, "stop");
+  assert.deepEqual(finish.usage, { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 }); // 5+11 chars → ceil(5/4)+ceil(11/4)
 });
 
 test("empty completion → HTTP 502 upstream_empty (stream)", async () => {
@@ -100,6 +107,9 @@ test("tool call: fenced block becomes tool_calls with finish_reason tool_calls",
   assert.deepEqual(JSON.parse(msg.tool_calls[0].function.arguments), { city: "Tokyo" });
   assert.equal(j.choices[0].finish_reason, "tool_calls");
   assert.equal(msg.content, "");
+  // Tool-path usage counts the call name and arguments in completion tokens.
+  assert.equal(j.usage.completion_tokens, 7); // "get_weather" + {"city":"Tokyo"} = 27 chars
+  assert.equal(j.usage.total_tokens, j.usage.prompt_tokens + j.usage.completion_tokens);
 });
 
 test("tool result replay: role:tool rides as a user turn", async () => {

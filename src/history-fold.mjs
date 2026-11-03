@@ -26,8 +26,13 @@ export function foldHistory(hist, toolsActive) {
   const rest = hist.slice(sys);
 
   const units = buildUnits(rest);
-  const starts = groupStarts(units);
   if (units.length === 0) return { hist, folded: false };
+  // Every unit is a foldable boundary: a plain message folds alone and an
+  // assistant-calls+results unit travels as one. The old groupStarts (plain
+  // user heads only) wedged tailStart at 0 for all-tool conversations — the
+  // cap loop then broke immediately and a long tool session never folded,
+  // deadlocking against the upstream message cap.
+  const starts = units.map((_, i) => i);
 
   // Tail: the newest complete turn-groups whose message count first reaches
   // FOLD_KEEP_RECENT. A group that crosses the threshold travels whole.
@@ -106,17 +111,6 @@ function buildUnits(msgs) {
     }
   }
   return units;
-}
-
-// groupStarts: unit 0, and every later unit whose head is a plain user
-// message (a user turn without tool results opens a new conversational turn).
-function groupStarts(units) {
-  const starts = [];
-  units.forEach((u, i) => {
-    const h = u.msgs[0];
-    if (i === 0 || (h.role === 'user' && (h.results?.length ?? 0) === 0)) starts.push(i);
-  });
-  return starts;
 }
 
 function unitMsgCount(units, from) {

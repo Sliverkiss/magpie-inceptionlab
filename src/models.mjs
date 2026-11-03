@@ -27,6 +27,12 @@ export function toStaticModel(m) {
     // Text-only: the upstream web client accepts no image parts.
     modalities: { input: ["text"], output: ["text"] },
     attachment: false,
+    capabilities: {
+      reasoning: true,
+      attachment: false,
+      toolcall: true,
+      input: { ...TEXT_ONLY },
+    },
     // Reasoning tiers: the keys become magpie's effort picker and ride the
     // request as reasoning_effort, which convert.mjs maps onto the upstream's
     // reasoningEffort. Instant (the web client's lowest tier) is reachable as

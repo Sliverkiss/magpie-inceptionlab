@@ -1,6 +1,6 @@
 {
   "name": "inceptionlab",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Inception Mercury (chat.inceptionlabs.ai) provider plugin for magpie / OpenCode: anonymous diffusion-LLM access with Vercel-checkpoint clearance, reasoning passthrough, native web-search citations and full tool-call bridging.",
   "type": "module",
   "main": "./index.mjs",
@@ -12,8 +12,7 @@
     "CHANGELOG.md",
     "LICENSE",
     "registry-entry.json",
-    "tests",
-    "scripts"
+    "tests"
   ],
   "keywords": [
     "magpie",
@@ -31,7 +30,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Sliverkiss/inceptionlabs2api.git"
+    "url": "git+https://github.com/Sliverkiss/magpie-inceptionlab.git"
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
@@ -42,7 +41,6 @@
     "name": "Mercury Inception"
   },
   "scripts": {
-    "test": "node --test",
-    "check": "node scripts/check.mjs"
+    "test": "node --test"
   }
 }

@@ -18,6 +18,7 @@ Mercury 3 是 Inception Labs 的扩散式大语言模型（diffusion LLM），�
 - **推理过程透传** —— `reasoning_content` 增量流式输出
 - **联网搜索引用** —— 搜索来源自动注入 `annotations`
 - **流式 / 非流式** —— 完整 OpenAI chat completions 兼容；空回答返回真实的 HTTP 502，绝不静默
+- **Token 用量统计** —— 上游不返回 usage，网关按 ~4 字符/token 自算并随每个响应返回标准 `usage`（额度展示用途，非计费数据）
 
 ## 快速开始
 

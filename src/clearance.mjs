@@ -20,7 +20,6 @@ export const CookieName = "_vcrcs";
 const REFRESH = 45 * 60_000; // proactive replace age; edge TTL is 60m
 const COOLDOWN = 15_000; // per-slot retry spacing after a FAILED acquisition
 const TIMEOUT = 30_000; // bounds one acquisition (GET + solve + POST)
-const MAX_BODY = 1 << 20;
 
 // ErrRefused means the edge rejected the proof of work itself (checkpoint
 // version drift). Retrying cannot help.
@@ -54,7 +53,7 @@ function apiProbeHeaders() {
 // fetchChallenge GETs /api/session without a cookie and returns the challenge
 // token. 200 = no challenge needed (errNoChallenge); 429/403 + token = one
 // challenge; anything else is a typed failure.
-async function fetchChallenge(fetchImpl, logf) {
+async function fetchChallenge(fetchImpl) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(new ClearanceError("challenge probe timeout")), TIMEOUT);
   try {
@@ -80,7 +79,7 @@ async function fetchChallenge(fetchImpl, logf) {
 
 // submitSolution POSTs the solved token; 204/200 sets the _vcrcs cookie,
 // 403 rejects the proof itself (never retried).
-async function submitSolution(fetchImpl, token, solution, logf) {
+async function submitSolution(fetchImpl, token, solution) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(new ClearanceError("submit timeout")), TIMEOUT);
   try {
@@ -122,16 +121,12 @@ async function submitSolution(fetchImpl, token, solution, logf) {
 
 // acquire solves one challenge and returns a cookie string. One attempt; the
 // caller owns pacing (cooldown) and retries.
-export async function acquire(fetchImpl, logf = () => {}) {
-  logf("clear: acquiring clearance");
-  const probe = await fetchChallenge(fetchImpl, logf);
-  if (probe.noChallenge) {
-    throw new ClearanceError("no challenge offered (edge does not challenge this egress)");
-  }
+export async function acquire(fetchImpl) {
+  const probe = await fetchChallenge(fetchImpl);
+  if (probe.noChallenge) return ""; // edge stopped challenging this egress
   const { solveToken } = await import("./solve.mjs");
   const solution = solveToken(probe.token);
-  const cookie = await submitSolution(fetchImpl, probe.token, solution, logf);
-  logf(`clear: acquired (${cookie.split("=")[0]})`);
+  const cookie = await submitSolution(fetchImpl, probe.token, solution);
   return cookie;
 }
 
@@ -146,13 +141,11 @@ const SlotCooldown = "cooldown";
 // has nothing live (Ensure), because a challenged cookie retires and the
 // request replays on the next live slot.
 export class Clearance {
-  constructor({ size = 2, fetchImpl = fetch, logf = () => {} } = {}) {
+  constructor({ size = 2, fetchImpl = fetch } = {}) {
     this.size = Math.max(1, size);
     this.fetchImpl = fetchImpl;
-    this.logf = logf;
     this.slots = Array.from({ length: this.size }, () => ({ state: SlotPending, cookie: "", acquired: 0, retryAt: 0 }));
     this.acquireInflight = null;
-    this.fillTimer = null;
   }
 
   // header returns the UA and the first live, non-stale cookie, or nulls.
@@ -166,18 +159,6 @@ export class Clearance {
   liveCount() {
     const now = Date.now();
     return this.slots.filter((s) => s.state === SlotLive && now - s.acquired < REFRESH).length;
-  }
-
-  stats() {
-    const now = Date.now();
-    let live = 0, cooldown = 0, stale = 0;
-    for (const s of this.slots) {
-      if (s.state === SlotLive) {
-        if (now - s.acquired >= REFRESH) stale++;
-        else live++;
-      } else if (s.state === SlotCooldown) cooldown++;
-    }
-    return { size: this.size, live, cooldown, stale };
   }
 
   // retire drops the slot carrying exactly this cookie (""-valued misses are
@@ -200,21 +181,46 @@ export class Clearance {
     slot.retryAt = Date.now() + COOLDOWN;
   }
 
+  // expireCooldowns flips cooldown slots whose retryAt has passed back to
+  // pending, so pacing gates retries without ever wedging the ring: a ring of
+  // nothing but cooldown slots would give ensure/topUp nowhere to park a
+  // freshly acquired cookie (the solve would be silently discarded).
+  expireCooldowns() {
+    const now = Date.now();
+    for (const s of this.slots) {
+      if (s.state === SlotCooldown && now >= s.retryAt) {
+        s.state = SlotPending;
+        s.retryAt = 0;
+      }
+    }
+  }
+
+  // parkCookie writes a freshly acquired cookie into a usable slot,
+  // pre-empting the oldest slot when the ring has none — an acquired cookie is
+  // never discarded.
+  parkCookie(cookie) {
+    let slot = this.slots.find((s) => s.state === SlotPending);
+    if (!slot) {
+      slot = this.slots.find((s) => s.state === SlotLive && Date.now() - s.acquired >= REFRESH)
+        ?? this.slots.reduce((a, b) => (a.acquired <= b.acquired ? a : b));
+    }
+    slot.state = SlotLive;
+    slot.cookie = cookie;
+    slot.acquired = Date.now();
+    slot.retryAt = 0;
+  }
+
   // ensure guarantees at least one live cookie: it solves inline when the
   // ring has nothing live (the lazy fallback), collapsing concurrent callers
   // onto one acquisition. Never tops up a partially filled ring.
   async ensure() {
     if (this.liveCount() > 0) return;
     if (this.acquireInflight) return this.acquireInflight;
+    this.expireCooldowns();
     this.acquireInflight = (async () => {
       try {
-        const cookie = await acquire(this.fetchImpl, this.logf);
-        const slot = this.slots.find((s) => s.state === SlotPending || s.state === SlotLive && Date.now() - s.acquired >= REFRESH);
-        if (slot) {
-          slot.state = SlotLive;
-          slot.cookie = cookie;
-          slot.acquired = Date.now();
-        }
+        const cookie = await acquire(this.fetchImpl);
+        if (cookie) this.parkCookie(cookie);
       } catch (e) {
         if (e instanceof RefusedError) throw e; // never retried
         this.markFailed();
@@ -233,6 +239,7 @@ export class Clearance {
   topUp() {
     if (this.acquireInflight) return;
     if (this.liveCount() >= this.size) return;
+    this.expireCooldowns();
     const now = Date.now();
     const target = this.slots.find(
       (s) => s.state === SlotPending || (s.state === SlotLive && now - s.acquired >= REFRESH),
@@ -240,24 +247,17 @@ export class Clearance {
     if (!target) return;
     this.acquireInflight = (async () => {
       try {
-        const cookie = await acquire(this.fetchImpl, this.logf);
-        target.state = SlotLive;
-        target.cookie = cookie;
-        target.acquired = Date.now();
+        const cookie = await acquire(this.fetchImpl);
+        // Empty cookie = edge stopped challenging: nothing to park, the ring
+        // just stays as-is (header() sends without a cookie, which is right).
+        if (cookie) this.parkCookie(cookie);
       } catch (e) {
-        if (e instanceof RefusedError) {
-          this.logf("clear: proof of work refused; leaving the slot for the next request");
-        } else {
-          this.markFailed();
-          this.logf(`clear: top-up acquisition failed: ${e?.message || e}`);
-        }
+        // RefusedError is never retried: leave the slot pending for the next
+        // request; any other failure goes to cooldown.
+        if (!(e instanceof RefusedError)) this.markFailed();
       } finally {
         this.acquireInflight = null;
       }
     })();
-  }
-
-  stopFillLoop() {
-    if (this.fillTimer) { clearTimeout(this.fillTimer); this.fillTimer = null; }
   }
 }

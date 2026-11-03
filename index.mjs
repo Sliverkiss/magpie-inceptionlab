@@ -28,8 +28,13 @@ import { STATIC_MODELS, toStaticModel, buildModelMap } from "./src/models.mjs";
 
 const PROVIDER = "inceptionlab";
 
+// Built once: the catalog is static, so the host-facing model entries and the
+// id→route map never change after module load.
+const MODEL_ENTRIES = Object.fromEntries(STATIC_MODELS.map((m) => [m.id, toStaticModel(m)]));
+const MODEL_MAP = buildModelMap(STATIC_MODELS);
+
 export const InceptionlabPlugin = async () => {
-  const client = new Client({ logf: (m) => console.log(`[inceptionlab] ${m}`) });
+  const client = new Client();
   setClient(client);
 
   return {
@@ -39,13 +44,14 @@ export const InceptionlabPlugin = async () => {
         name: "Mercury Inception",
         npm: "@ai-sdk/openai-compatible",
         api: `${up.BASE}/v1`,
-        models: Object.fromEntries(STATIC_MODELS.map((m) => [m.id, toStaticModel(m)])),
+        models: MODEL_ENTRIES,
       };
     },
 
     auth: {
       provider: PROVIDER,
       maxConcurrency: 2,
+      refreshLead: 5 * 60_000,
 
       methods: [{
         type: "api",
@@ -54,7 +60,8 @@ export const InceptionlabPlugin = async () => {
         async authorize() {
           // api-type dispatch calls authorize() directly and wants the
           // terminal object; failure must throw. No network here: the
-          // clearance PoW + session warmup happen lazily on first request.
+          // clearance PoW warmup happens at plugin load (Client ctor), and
+          // session tokens lazily on first request.
           return { type: "success", key: "anonymous", expires: 0 };
         },
       }],
@@ -86,7 +93,7 @@ export const InceptionlabPlugin = async () => {
                 body: typeof init?.body === "string"
                   ? init.body
                   : (init?.body ? new TextDecoder().decode(init.body) : init?.body),
-                modelMap: buildModelMap(STATIC_MODELS),
+                modelMap: MODEL_MAP,
                 signal: init?.signal,
               });
             } catch (err) {
@@ -116,7 +123,7 @@ export const InceptionlabPlugin = async () => {
     provider: {
       id: PROVIDER,
       async models() {
-        return Object.fromEntries(STATIC_MODELS.map((m) => [m.id, toStaticModel(m)]));
+        return { ...MODEL_ENTRIES };
       },
     },
   };

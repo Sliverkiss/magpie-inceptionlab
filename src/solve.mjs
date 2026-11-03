@@ -5,8 +5,12 @@ import { createHash } from "node:crypto";
 
 const PREFIX_LEN = 4;
 const MULTIPLIERS = [498787, 533737, 619763, 708403, 828071];
+// A 4-hex prefix hits in ~65536 hashes; 2^26 is ~4000x that margin. Beyond it
+// the challenge is malformed/adversarial: fail fast instead of hanging the
+// inflight acquire (every later request would collapse onto the dead loop).
+const MAX_NONCE = 1 << 26;
 
-export function solveToken(token) {
+export function solveToken(token, maxNonce = MAX_NONCE) {
   const parts = token.split(".");
   if (parts.length < 4) {
     throw new Error(`malformed token: ${parts.length} dot-parts`);
@@ -27,10 +31,10 @@ export function solveToken(token) {
 
   const out = [];
   let nonce = 0;
-  const buf = Buffer.alloc(16); // reused: prefix + 16-hex nonce
   for (let i = 0; i < rounds; i++) {
     let found = false;
     while (!found) {
+      if (nonce > maxNonce) throw new Error(`nonce budget exhausted in round ${i}`);
       const h = nonce.toString(16).padStart(16, "0");
       nonce++;
       const digest = createHash("sha256").update(prefix + h).digest("hex");

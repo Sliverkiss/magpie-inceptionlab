@@ -10,6 +10,7 @@ export const RECOVERY_CLEAN = 'clean';
 export const RECOVERY_TRUNCATED = 'truncated';
 export const RECOVERY_PARSE_FAILED = 'parse_failed';
 export const RECOVERY_REFUSED = 'refused';
+export const RECOVERY_UNDECLARED = 'undeclared';
 
 // retrySnippetLimit bounds the original-output tail embedded in a retry
 // message, so a long broken round cannot balloon the retry turn.
@@ -33,8 +34,13 @@ const FOREIGN_JSON_OPENERS = ['"tool_calls":', 'function.name:'];
 //     holds unbalanced {/[ — brace-guarded so prose ending in a colon stays
 //     clean.
 //
+// A CALL_BLOCKED envelope that closed cleanly but whose body names an
+// undeclared tool is UNDECLARED — distinct from parse_failed: the model wrote
+// a well-formed call for a tool that does not exist. Echoing that block back
+// as an assistant turn would reinforce the hallucination on the retry.
+//
 // Empty text is clean: the empty-answer retry is separate behavior.
-export function classifyNoCall(text) {
+export function classifyNoCall(text, declared) {
   if (!text || !text.trim()) return RECOVERY_CLEAN;
 
   // The refusal shape is checked FIRST: a canned refusal arrives as plain
@@ -53,7 +59,9 @@ export function classifyNoCall(text) {
     nClose += count(text, close);
   }
   for (const probe of FOREIGN_JSON_OPENERS) {
-    const n = count(text, probe);
+    // Only at a line start: a mention inside prose (the user asking "what is
+    // function.name:" or a code sample) is not an envelope attempt.
+    const n = countAtLineStart(text, probe);
     nOpen += n;
     foreignSeen = foreignSeen || n > 0;
   }
@@ -66,8 +74,47 @@ export function classifyNoCall(text) {
     if (unbalancedJSONTail(trimmed)) return RECOVERY_TRUNCATED;
   }
 
-  if (opened || foreignSeen) return RECOVERY_PARSE_FAILED;
+  if (opened) {
+    if (hasUndeclaredCall(text, declared)) return RECOVERY_UNDECLARED;
+    return RECOVERY_PARSE_FAILED;
+  }
+  if (foreignSeen) return RECOVERY_PARSE_FAILED;
   return RECOVERY_CLEAN;
+}
+
+// hasUndeclaredCall reports whether any complete <tool_call> block holds
+// a JSON call whose name is not in the declared set.
+function hasUndeclaredCall(text, declared) {
+  const names = new Set(declared ?? []);
+  let i = 0;
+  for (;;) {
+    const s = text.indexOf('<tool_call>', i);
+    if (s < 0) return false;
+    const e = text.indexOf('</tool_call>', s);
+    if (e < 0) return false;
+    const body = text.slice(s + '<tool_call>'.length, e).trim();
+    try {
+      const raw = JSON.parse(body);
+      if (raw && typeof raw === 'object' && typeof raw.name === 'string') {
+        if (!names.has(raw.name)) return true;
+      }
+    } catch { /* not a parseable body — the parse_failed path owns it */ }
+    i = e + '</tool_call>'.length;
+  }
+}
+
+// countAtLineStart counts sub occurrences preceded only by whitespace since
+// the previous newline (or at offset 0).
+function countAtLineStart(s, sub) {
+  let n = 0, i = 0;
+  for (;;) {
+    i = s.indexOf(sub, i);
+    if (i < 0) return n;
+    let j = i - 1;
+    while (j >= 0 && (s[j] === ' ' || s[j] === '\t')) j--;
+    if (j < 0 || s[j] === '\n' || s[j] === '\r') n++;
+    i += sub.length;
+  }
 }
 
 // unbalancedJSONTail reports whether s holds more opening than closing
@@ -101,6 +148,14 @@ export function retryMessageTruncated(snippet) {
 
 export function retryMessageParseFailed(snippet) {
   return 'Your previous tool-call output could not be parsed. Re-emit a valid tool call protocol block for the listed tools only. Your previous output was:\n\n' + snippetTail(snippet);
+}
+
+// retryMessageUndeclared re-anchors the model to the declared tool list. The
+// hallucinated block is NOT embedded (same reasoning as the refusal retry):
+// replaying it would show the model its own invented tool as conversation
+// fact.
+export function retryMessageUndeclared() {
+  return 'Your previous answer contained a tool call for a tool that does not exist. Use ONLY the tools listed in the tool operations above — never invent an operation name. Re-emit the COMPLETE tool call block using one of the listed tools, or answer normally if none applies.';
 }
 
 // classifyRefusal recognizes the canned refusal shapes (recovery.go
