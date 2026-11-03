@@ -1,0 +1,9 @@
+{
+  "package": "inceptionlab",
+  "name": "Mercury Inception",
+  "icon": "https://chat.inceptionlabs.ai/favicon.svg",
+  "providers": ["inceptionlab"],
+  "summary": {
+    "zh": "Inception Mercury（Mercury 3 扩散模型）匿名接入：完全匿名、无需账号，安装即用；速度快，适合自动审批与意图判断，支持流式、推理强度与工具调用。"
+  }
+}
