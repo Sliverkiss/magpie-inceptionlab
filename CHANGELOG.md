@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.2 — 2026-11-03
+
+- **Background fill loop removed** (owner ruling): refills are demand-driven only. `ensure()` solves inline when the ring has no live cookie, and a retired slot waits for the next request that needs one. No background timer means the punitive window can't be amplified by a loop retrying a doomed solve every 1.5 s; total edge traffic during a penalty is bounded by real requests. Constructor still does one opportunistic warmup solve per session, never on a timer.
+
+## 0.2.1 — 2026-11-03
+
+Clearance hardening round 2 (post-review fixes).
+
+- **Forced solve actually forces**: a challenge on the request path invalidates the probe cache (`noteChallenge`); previously a cached "unchallenged" answer would block every recovery solve for 45 minutes, turning the replay chain into a 503 loop.
+- **Replay chain fixed**: every attempt captures the cookie that carried it and retires exactly that one on a challenge (previously the retire was a no-op on an already-retired cookie while the challenged spare stayed live); `forceAcquire` no longer clears a slot before solving (a throw can no longer drop a live cookie); `ensure()` no longer silently succeeds on a failed background solve.
+- **Single-flight shared**: request path and opportunistic refill never launch two solves at once.
+- **Client abort propagates**: `readSSE` now races the abort signal — a canceled request stops reading the upstream immediately instead of idling up to 60 s.
+- **Status passthrough**: upstream 429/5xx statuses now reach magpie verbatim instead of collapsing to 502 (Retry-After semantics preserved).
+- Tests: probe-cache invalidation, forced solve, single-flight, forceAcquire slot safety, retire pacing, SSE abort.
+
 ## 0.2.0 — 2026-11-03
 
 Review hardening + self-computed token usage.

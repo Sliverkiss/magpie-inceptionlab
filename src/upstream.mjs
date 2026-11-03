@@ -89,9 +89,22 @@ export async function readSSE(body, onEvent, { signal, idleMs = IDLE_TIMEOUT, on
   idlePromise.catch(() => {}); // no unhandled rejection when the pump wins
   armIdle();
 
+  // Client abort: stop reading the upstream immediately instead of idling out
+  // (which would hold the upstream connection for up to idleMs after the
+  // caller has gone). The aborted race rejects; finally cancels the reader.
+  const abortPromise = signal
+    ? new Promise((_, rej) => {
+        if (signal.aborted) rej(new Error("aborted"));
+        else signal.addEventListener("abort", () => rej(new Error("aborted")), { once: true });
+      })
+    : null;
+  abortPromise?.catch(() => {});
+
   try {
     while (true) {
-      const { value, done: eof } = await Promise.race([reader.read(), idlePromise]);
+      const { value, done: eof } = await Promise.race(
+        abortPromise ? [reader.read(), idlePromise, abortPromise] : [reader.read(), idlePromise],
+      );
       if (eof) break;
       armIdle();
       buf += decoder.decode(value, { stream: true });
@@ -144,10 +157,14 @@ export class Client {
       max: poolMax,
       fetchToken: () => this.fetchSession(),
     });
-    // Request-driven warmup: no background loop against the edge. The first
-    // chat solves inline via ensure(); each successful request tops the ring
-    // up by one slot (retire() and expiry also call it).
+    // One opportunistic warmup solve at load; no background loop (owner
+    // ruling — refills are demand-driven, never a self-imposed timer).
     this.clearance.topUp();
+  }
+
+  // clearanceStatus exposes Clearance.status() for magpie's usage hook.
+  clearanceStatus() {
+    return this.clearance.status();
   }
 
   // fetchSession calls GET /api/session once through the clearance path and
@@ -197,11 +214,14 @@ export class Client {
     return { resp, cookie };
   }
 
-  // send performs one request with clearance handling: on a challenge it
-  // retires the cookie that carried it and replays ONCE on the next live
-  // cookie; the request path never waits for a solve (ensure() only solves
-  // inline when the ring has nothing live). A plain 429 (rate limit) retires
-  // the slot and passes the 429 through — the ring rotation is the recovery.
+  // send performs one request with clearance handling. On a challenge it
+  // retires the cookie that carried it and replays — first on the next live
+  // cookie if the ring has one, otherwise on a forced fresh solve; the forced
+  // solve is the difference between a 120 ms PoW and a 503, because the edge
+  // challenges by egress and the spare cookie is challenged too. A plain 429
+  // (rate limit) retires the slot and passes through; the ring rotation is
+  // the recovery. No backoff: a second challenge fails fast, magpie's own
+  // fallback machinery rests the account, and the next request retries.
   async send(method, path, body, opts = {}) {
     await this.clearance.ensure();
     let { resp, cookie } = await this.do(method, path, body, opts);
@@ -211,12 +231,29 @@ export class Client {
     }
     if (!isChallenge(resp)) return resp;
     await resp.body?.cancel();
+    this.clearance.noteChallenge();
     this.clearance.retire(cookie);
-    await this.clearance.ensure();
-    ({ resp } = await this.do(method, path, body, opts));
+    if (this.clearance.liveCount() === 0) await this.clearance.ensure();
+    ({ resp, cookie } = await this.do(method, path, body, opts));
     if (isChallenge(resp)) {
+      // The spare was challenged too: the egress itself is being challenged.
+      // Force one fresh solve (bypassing the probe cache — "unchallenged"
+      // was just falsified) and replay a final time.
       await resp.body?.cancel();
-      throw new ClearanceError(`the checkpoint challenged ${path} even after a fresh clearance`);
+      this.clearance.retire(cookie);
+      try {
+        await this.clearance.forceAcquire();
+      } catch { /* fall through to the final attempt; it will fail anyway */ }
+      ({ resp, cookie } = await this.do(method, path, body, opts));
+      if (isChallenge(resp)) {
+        // Fresh cookie, still challenged: this is the punitive window.
+        // Fail fast; the next request retries when the edge relents.
+        await resp.body?.cancel();
+        this.clearance.noteChallenge();
+        this.clearance.retire(cookie);
+        this.clearance.stampFailure(new ClearanceError(`fresh cookie challenged on ${path}`));
+        throw new ClearanceError(`the checkpoint challenged ${path} even after a fresh clearance`);
+      }
     }
     return resp;
   }

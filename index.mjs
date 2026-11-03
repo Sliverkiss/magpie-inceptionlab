@@ -14,8 +14,9 @@
 //     probes (a spinning login button reads as a hang).
 //   - expires:0 records are never renewed; refresh() is a no-op.
 //   - no credits exist upstream: usage returns identity only — never balance
-//     (keysSum wants a bare number string), never windows/plan (either would
-//     spread the keys card layout).
+//     (keysSum wants a bare number string), never windows/plan. Clearance
+//     failures surface as 503/429 responses, which magpie's own fallback
+//     machinery rests the account on — the plugin doesn't second-guess it.
 //   - checkin: no check-in activity exists → the valid "inactive" outcome.
 //   - provider.models falls back to the static table, never an empty map.
 //   - every fetch error maps into the OpenAI error envelope; there is no
@@ -106,7 +107,9 @@ export const InceptionlabPlugin = async () => {
       },
 
       // No quota/credits exist upstream. Identity only, no network: a usage
-      // hook that probes stalls the whole quota page.
+      // hook that probes stalls the whole quota page. Routing-wise magpie
+      // handles the failures itself: a 503/429 stream rests the account
+      // through its own fallback machinery, so no windows are reported.
       async usage(getAuth) {
         const auth = await getAuth();
         if (!auth) return { error: "未启用" };

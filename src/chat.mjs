@@ -456,7 +456,11 @@ function mapUpstreamError(err) {
   }
   if (err instanceof UpstreamError) {
     const msg = upstreamMessage(err) || `upstream returned HTTP ${err.status}`;
-    return [502, msg, "server_error", "upstream_error", ""];
+    // Rate limits and upstream 5xx pass through verbatim (HOOKS.md 七): the
+    // gateway parses Retry-After from a 429 and treats 5xx differently from
+    // a generic 502.
+    const status = err.status === 429 || err.status >= 500 ? err.status : 502;
+    return [status, msg, "server_error", "upstream_error", ""];
   }
   return [502, "upstream request failed", "server_error", "upstream_error", ""];
 }

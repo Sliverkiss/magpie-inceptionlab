@@ -18,8 +18,16 @@ export const CookieName = "_vcrcs";
 
 // Lifecycle defaults (clear.go).
 const REFRESH = 45 * 60_000; // proactive replace age; edge TTL is 60m
-const COOLDOWN = 15_000; // per-slot retry spacing after a FAILED acquisition
 const TIMEOUT = 30_000; // bounds one acquisition (GET + solve + POST)
+// No backoff, no cooldown, no background loop (owner ruling): the punitive
+// edge recovers on its own schedule (~210s measured), and every refill is
+// demand-driven — ensure() solves inline when the ring is empty, and the next
+// request retries as soon as the edge relents. The shared single-flight is
+// what keeps concurrent callers from stampeding.
+// How long a "this egress is not challenged" probe result is trusted. Same
+// reasoning as REFRESH: the edge re-evaluates egress trust on a cookie-like
+// schedule (clear.go probed/probedAt).
+const PROBED_TTL = 45 * 60_000;
 
 // ErrRefused means the edge rejected the proof of work itself (checkpoint
 // version drift). Retrying cannot help.
@@ -120,7 +128,10 @@ async function submitSolution(fetchImpl, token, solution) {
 }
 
 // acquire solves one challenge and returns a cookie string. One attempt; the
-// caller owns pacing (cooldown) and retries.
+// caller owns pacing (cooldown) and retries. A 200 probe returns "" — the
+// caller records it via recordProbed() so later acquisitions skip the probe
+// GET for one refresh window (the edge re-evaluates egress trust on the same
+// schedule a cookie would lapse).
 export async function acquire(fetchImpl) {
   const probe = await fetchChallenge(fetchImpl);
   if (probe.noChallenge) return ""; // edge stopped challenging this egress
@@ -130,22 +141,95 @@ export async function acquire(fetchImpl) {
   return cookie;
 }
 
-// Slot is one ring slot (SPEC §2.1.2): pending → live → (retire) → pending,
-// or → cooldown after a failed acquisition.
+// Slot is one ring slot (SPEC §2.1.2): pending → live → (retire) → pending.
+// No cooldown state: failed solves are retryable by the next request
+// (owner ruling — no self-throttling; the edge recovers on its own schedule).
 const SlotPending = "pending";
 const SlotLive = "live";
-const SlotCooldown = "cooldown";
 
-// Clearance is a small ring of cookies with lazy Ensure, slot Retire and a
-// background fill loop. The chat path never waits for a solve unless the ring
-// has nothing live (Ensure), because a challenged cookie retires and the
-// request replays on the next live slot.
+// Clearance is a small ring of cookies with lazy Ensure and slot Retire. The
+// chat path never waits for a solve unless the ring has nothing live
+// (Ensure), because a challenged cookie retires and the request replays on
+// the next live slot; every refill is demand-driven.
 export class Clearance {
   constructor({ size = 2, fetchImpl = fetch } = {}) {
     this.size = Math.max(1, size);
     this.fetchImpl = fetchImpl;
     this.slots = Array.from({ length: this.size }, () => ({ state: SlotPending, cookie: "", acquired: 0, retryAt: 0 }));
     this.acquireInflight = null;
+    // status() reads these counters for diagnostics.
+    this.lastSolveAt = 0;
+    this.solves = 0; // real solves (probe GET + PoW + POST) that returned a cookie
+    this.solveFailures = 0;
+    this.lastSolveError = "";
+    this.lastChallengeAt = 0; // a request observed a challenge
+    // probed: the edge said "no challenge needed" (acquire returned "").
+    // Clearing the ring re-probes only after PROBED_TTL — without this, an
+    // unchallenged egress pays one GET /api/session per request for nothing.
+    this.probed = false;
+    this.probedAt = 0;
+  }
+
+  // solveOnce runs one acquisition with the probe cache: when a previous
+  // acquire returned "" within PROBED_TTL, skip the probe GET entirely and
+  // report "unchallenged" again. Any solve that comes back with a real
+  // cookie clears the flag — the edge is challenging again.
+  async solveOnce() {
+    const now = Date.now();
+    if (this.probed && now - this.probedAt < PROBED_TTL) return "";
+    const cookie = await acquire(this.fetchImpl);
+    if (cookie) {
+      this.probed = false;
+      this.probedAt = 0;
+    } else {
+      this.probed = true;
+      this.probedAt = now;
+    }
+    return cookie;
+  }
+
+  // status is the magpie usage hook's view of clearance health: live slots
+  // and solve counters.
+  status() {
+    const now = Date.now();
+    return {
+      slots: this.size,
+      live: this.liveCount(),
+      solves: this.solves,
+      solveFailures: this.solveFailures,
+      lastSolveError: this.lastSolveError,
+      lastSolveAgeMs: this.lastSolveAt ? now - this.lastSolveAt : -1,
+      lastChallengeAgeMs: this.lastChallengeAt ? now - this.lastChallengeAt : -1,
+    };
+  }
+
+  // noteChallenge records that a REQUEST was challenged. This is the only
+  // path that invalidates the probe cache: the edge's "no challenge" answer
+  // (probed) is falsified the moment a real request is challenged, and
+  // without this the cache would block every recovery solve for PROBED_TTL.
+  noteChallenge() {
+    this.lastChallengeAt = Date.now();
+    this.probed = false;
+    this.probedAt = 0;
+  }
+
+  // backoffNow reports whether acquisitions are globally paused. Always
+  // false: the global backoff was removed at owner's ruling.
+  backoffNow() {
+    return false;
+  }
+
+  // stampFailure records a failed solve (counters only; no pacing).
+  stampFailure(err) {
+    this.lastSolveAt = Date.now();
+    this.solveFailures++;
+    this.lastSolveError = String(err?.message ?? err ?? "").slice(0, 200);
+  }
+
+  stampSuccess() {
+    this.lastSolveAt = Date.now();
+    this.solves++;
+    this.lastSolveError = "";
   }
 
   // header returns the UA and the first live, non-stale cookie, or nulls.
@@ -163,6 +247,8 @@ export class Clearance {
 
   // retire drops the slot carrying exactly this cookie (""-valued misses are
   // ignored, mirroring the Go Retire semantics for an unprotected probe).
+  // No refill here: the next request's ensure() solves inline when the ring
+  // empties, so a retired slot is refilled on demand, never in a burst.
   retire(cookie) {
     if (!cookie) return;
     const slot = this.slots.find((s) => s.state === SlotLive && s.cookie === cookie);
@@ -170,30 +256,16 @@ export class Clearance {
     slot.state = SlotPending;
     slot.cookie = "";
     slot.acquired = 0;
-    this.topUp();
   }
 
-  // markFailed puts the slot that just failed acquisition into cooldown.
-  markFailed() {
-    const slot = this.slots.find((s) => s.state === SlotPending || s.state === SlotCooldown);
-    if (!slot) return;
-    slot.state = SlotCooldown;
-    slot.retryAt = Date.now() + COOLDOWN;
-  }
+  // markFailed is kept as a no-op for call-site compatibility: per-slot
+  // cooldowns were removed at owner's ruling (no self-throttling — the edge
+  // recovers on its own schedule and every failed solve must be retryable by
+  // the very next request).
+  markFailed() {}
 
-  // expireCooldowns flips cooldown slots whose retryAt has passed back to
-  // pending, so pacing gates retries without ever wedging the ring: a ring of
-  // nothing but cooldown slots would give ensure/topUp nowhere to park a
-  // freshly acquired cookie (the solve would be silently discarded).
-  expireCooldowns() {
-    const now = Date.now();
-    for (const s of this.slots) {
-      if (s.state === SlotCooldown && now >= s.retryAt) {
-        s.state = SlotPending;
-        s.retryAt = 0;
-      }
-    }
-  }
+  // expireCooldowns is a no-op: no slot state uses cooldown anymore.
+  expireCooldowns() {}
 
   // parkCookie writes a freshly acquired cookie into a usable slot,
   // pre-empting the oldest slot when the ring has none — an acquired cookie is
@@ -212,18 +284,26 @@ export class Clearance {
 
   // ensure guarantees at least one live cookie: it solves inline when the
   // ring has nothing live (the lazy fallback), collapsing concurrent callers
-  // onto one acquisition. Never tops up a partially filled ring.
+  // onto one acquisition. No global pacing: a failed solve is retryable by
+  // the next request. If an inflight topUp is running, await it but
+  // re-check: topUp swallows failures, so its success is not ours.
   async ensure() {
     if (this.liveCount() > 0) return;
-    if (this.acquireInflight) return this.acquireInflight;
-    this.expireCooldowns();
+    if (this.acquireInflight) {
+      await this.acquireInflight.catch(() => {});
+      if (this.liveCount() > 0) return;
+      throw new ClearanceError("clearance solve failed; no live cookie");
+    }
     this.acquireInflight = (async () => {
       try {
-        const cookie = await acquire(this.fetchImpl);
-        if (cookie) this.parkCookie(cookie);
+        const cookie = await this.solveOnce();
+        if (cookie) {
+          this.stampSuccess(); // only real solves count as solves
+          this.parkCookie(cookie);
+        }
+        // "" = edge not challenging; nothing to park, header() sends bare
       } catch (e) {
-        if (e instanceof RefusedError) throw e; // never retried
-        this.markFailed();
+        this.stampFailure(e);
         throw e;
       } finally {
         this.acquireInflight = null;
@@ -232,12 +312,12 @@ export class Clearance {
     return this.acquireInflight;
   }
 
-  // topUp refills one pending slot in the background, request-driven: the
-  // Client calls it after a successful request (and ensure() leaves it to
-  // the next request when it fails). Guarded by one inflight acquire and
-  // the per-slot cooldown, so a refusing edge sees a trickle, not a storm.
+  // topUp refills one pending slot after a successful session fetch — one
+  // opportunistic solve per session, never a timer. Recovery does not depend
+  // on it: ensure() solves inline whenever the ring is empty.
   topUp() {
     if (this.acquireInflight) return;
+    if (this.backoffNow()) return;
     if (this.liveCount() >= this.size) return;
     this.expireCooldowns();
     const now = Date.now();
@@ -247,17 +327,46 @@ export class Clearance {
     if (!target) return;
     this.acquireInflight = (async () => {
       try {
-        const cookie = await acquire(this.fetchImpl);
-        // Empty cookie = edge stopped challenging: nothing to park, the ring
-        // just stays as-is (header() sends without a cookie, which is right).
-        if (cookie) this.parkCookie(cookie);
+        const cookie = await this.solveOnce();
+        if (cookie) {
+          this.stampSuccess();
+          this.parkCookie(cookie);
+        }
       } catch (e) {
-        // RefusedError is never retried: leave the slot pending for the next
-        // request; any other failure goes to cooldown.
-        if (!(e instanceof RefusedError)) this.markFailed();
+        this.stampFailure(e);
       } finally {
         this.acquireInflight = null;
       }
     })();
+  }
+
+  // forceAcquire solves once regardless of slot state (the request path's
+  // last resort when even the spare cookie was challenged). The probe cache
+  // is bypassed — the caller just observed a challenge, so "unchallenged" is
+  // stale by definition. No slot is touched before the solve: parkCookie
+  // pre-empts the oldest slot on success.
+  forceAcquire() {
+    if (this.acquireInflight) return this.acquireInflight;
+    this.acquireInflight = (async () => {
+      try {
+        this.probed = false;
+        this.probedAt = 0;
+        const cookie = await acquire(this.fetchImpl);
+        if (cookie) {
+          this.stampSuccess();
+          this.parkCookie(cookie);
+        } else {
+          this.stampSuccess(); // edge said "no challenge" — healthy signal
+          this.probed = true;
+          this.probedAt = Date.now();
+        }
+      } catch (e) {
+        this.stampFailure(e);
+        throw e;
+      } finally {
+        this.acquireInflight = null;
+      }
+    })();
+    return this.acquireInflight;
   }
 }
