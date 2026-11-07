@@ -156,7 +156,15 @@ export class Clearance {
     this.size = Math.max(1, size);
     this.fetchImpl = fetchImpl;
     this.slots = Array.from({ length: this.size }, () => ({ state: SlotPending, cookie: "", acquired: 0, retryAt: 0 }));
-    this.acquireInflight = null;
+    // Two independent single-flights, because two callers want two different
+    // contracts out of the same promise:
+    //   solveInflight  ensure() / forceAcquire() — "hand me a cookie or throw".
+    //   topUpInflight  topUp() — fire-and-forget; it swallows its own failure.
+    // One shared field made ensure() have to infer *whose* flight it had just
+    // awaited from `probed`, and that inference is exactly what read a dead
+    // topUp as a healthy egress. Separate fields, no inference.
+    this.solveInflight = null;
+    this.topUpInflight = null;
     // status() reads these counters for diagnostics.
     this.lastSolveAt = 0;
     this.solves = 0; // real solves (probe GET + PoW + POST) that returned a cookie
@@ -170,13 +178,20 @@ export class Clearance {
     this.probedAt = 0;
   }
 
+  // recentlyProbed reports whether a "this egress is not challenged" answer
+  // is still inside its trust window. Its only job now: skip the probe GET
+  // for one refresh window, instead of paying it on every request.
+  recentlyProbed() {
+    return this.probed && Date.now() - this.probedAt < PROBED_TTL;
+  }
+
   // solveOnce runs one acquisition with the probe cache: when a previous
   // acquire returned "" within PROBED_TTL, skip the probe GET entirely and
   // report "unchallenged" again. Any solve that comes back with a real
   // cookie clears the flag — the edge is challenging again.
   async solveOnce() {
+    if (this.recentlyProbed()) return "";
     const now = Date.now();
-    if (this.probed && now - this.probedAt < PROBED_TTL) return "";
     const cookie = await acquire(this.fetchImpl);
     if (cookie) {
       this.probed = false;
@@ -282,41 +297,83 @@ export class Clearance {
     slot.retryAt = 0;
   }
 
-  // ensure guarantees at least one live cookie: it solves inline when the
-  // ring has nothing live (the lazy fallback), collapsing concurrent callers
-  // onto one acquisition. No global pacing: a failed solve is retryable by
-  // the next request. If an inflight topUp is running, await it but
-  // re-check: topUp swallows failures, so its success is not ours.
+  // runSolve is the acquisition body every real flight shares: one solveOnce,
+  // counters stamped, a cookie parked on success. A rejection propagates
+  // typed — deciding whether to retry belongs to the caller.
+  async runSolve() {
+    try {
+      const cookie = await this.solveOnce();
+      if (cookie) {
+        this.stampSuccess(); // only real solves count as solves
+        this.parkCookie(cookie);
+      }
+      // "" = edge not challenging; nothing to park, header() sends bare
+    } catch (e) {
+      this.stampFailure(e);
+      throw e;
+    }
+  }
+
+  // startSolve installs runSolve() as the shared solve flight and releases the
+  // field the instant it settles — `.finally` runs before any awaiter resumes,
+  // so a caller that retries never finds a dead flight in the slot (and never
+  // clobbers one that replaced it).
+  startSolve() {
+    const flight = this.runSolve().finally(() => {
+      if (this.solveInflight === flight) this.solveInflight = null;
+    });
+    this.solveInflight = flight;
+    return flight;
+  }
+
+  // startTopUp is the same acquisition under the fire-and-forget contract: the
+  // failure is stamped inside runSolve() and swallowed here, because nothing
+  // is waiting on this flight.
+  startTopUp() {
+    const flight = this.runSolve().catch(() => {});
+    this.topUpInflight = flight;
+    flight.finally(() => {
+      if (this.topUpInflight === flight) this.topUpInflight = null;
+    });
+    return flight;
+  }
+
+  // ensure guarantees at least one live cookie: it solves inline when the ring
+  // has nothing live (the lazy fallback), collapsing concurrent callers onto
+  // one acquisition. No global pacing: a failed solve is retryable by the next
+  // request.
+  //
+  // Bounded at two attempts, and both are shared. The first is the flight
+  // every concurrent caller joins; if it rejects, the first caller to resume
+  // installs a second attempt and the rest join that one — so a dead edge
+  // costs two acquisitions per wave, not one per caller (0.2.2's promise that
+  // total traffic is capped by real request count). The second attempt's
+  // rejection is the caller's, typed: nothing is swallowed here.
+  //
+  // A "" result is health, not failure: an unchallenged egress parks nothing,
+  // so liveCount() stays 0 by design and header() sends bare.
   async ensure() {
     if (this.liveCount() > 0) return;
-    if (this.acquireInflight) {
-      await this.acquireInflight.catch(() => {});
-      if (this.liveCount() > 0) return;
-      throw new ClearanceError("clearance solve failed; no live cookie");
+    const first = this.solveInflight ?? this.startSolve();
+    try {
+      await first;
+    } catch {
+      // solveInflight only ever holds a genuine attempt (topUp's lives in
+      // topUpInflight), so this failure is real: fall through to the shared
+      // second attempt instead of throwing on the first one.
     }
-    this.acquireInflight = (async () => {
-      try {
-        const cookie = await this.solveOnce();
-        if (cookie) {
-          this.stampSuccess(); // only real solves count as solves
-          this.parkCookie(cookie);
-        }
-        // "" = edge not challenging; nothing to park, header() sends bare
-      } catch (e) {
-        this.stampFailure(e);
-        throw e;
-      } finally {
-        this.acquireInflight = null;
-      }
-    })();
-    return this.acquireInflight;
+    if (this.liveCount() > 0 || this.recentlyProbed()) return;
+    return this.solveInflight ?? this.startSolve();
   }
 
   // topUp refills one pending slot after a successful session fetch — one
-  // opportunistic solve per session, never a timer. Recovery does not depend
-  // on it: ensure() solves inline whenever the ring is empty.
+  // opportunistic solve per session, never a timer. It never joins a real
+  // solve (a caller that needs a cookie is already solving) and never blocks
+  // one; its own flight lives in topUpInflight and its failures stay there.
+  // Recovery does not depend on it: ensure() solves inline whenever the ring
+  // is empty.
   topUp() {
-    if (this.acquireInflight) return;
+    if (this.solveInflight || this.topUpInflight) return;
     if (this.backoffNow()) return;
     if (this.liveCount() >= this.size) return;
     this.expireCooldowns();
@@ -325,29 +382,20 @@ export class Clearance {
       (s) => s.state === SlotPending || (s.state === SlotLive && now - s.acquired >= REFRESH),
     );
     if (!target) return;
-    this.acquireInflight = (async () => {
-      try {
-        const cookie = await this.solveOnce();
-        if (cookie) {
-          this.stampSuccess();
-          this.parkCookie(cookie);
-        }
-      } catch (e) {
-        this.stampFailure(e);
-      } finally {
-        this.acquireInflight = null;
-      }
-    })();
+    this.startTopUp();
   }
 
   // forceAcquire solves once regardless of slot state (the request path's
   // last resort when even the spare cookie was challenged). The probe cache
   // is bypassed — the caller just observed a challenge, so "unchallenged" is
-  // stale by definition. No slot is touched before the solve: parkCookie
-  // pre-empts the oldest slot on success.
+  // stale by definition. It joins a real solve flight if one is in the air
+  // (that flight is a genuine attempt, so its outcome is an answer); it never
+  // joins a topUp, whose swallowed failure would look like success. No slot
+  // is touched before the solve: parkCookie pre-empts the oldest slot on
+  // success.
   forceAcquire() {
-    if (this.acquireInflight) return this.acquireInflight;
-    this.acquireInflight = (async () => {
+    if (this.solveInflight) return this.solveInflight;
+    const flight = (async () => {
       try {
         this.probed = false;
         this.probedAt = 0;
@@ -364,9 +412,10 @@ export class Clearance {
         this.stampFailure(e);
         throw e;
       } finally {
-        this.acquireInflight = null;
+        if (this.solveInflight === flight) this.solveInflight = null;
       }
     })();
-    return this.acquireInflight;
+    this.solveInflight = flight;
+    return flight;
   }
 }

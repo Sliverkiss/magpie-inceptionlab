@@ -6,12 +6,15 @@
 
 import { Clearance, ClearanceError, UserAgent, isChallenge, BASE } from "./clearance.mjs";
 import { TokenPool, validateToken } from "./session-pool.mjs";
+import { pumpLines, STOP, DEFAULT_IDLE_MS, IdleTimeoutError } from "./lines.mjs";
 
 export { BASE, UserAgent };
 export { validateToken };
+// The idle watchdog is the shared line pump's, re-exported so chat's error
+// mapper keeps one import for every upstream error type.
+export { IdleTimeoutError };
 
 const SESSION_TIMEOUT = 15_000; // bounds one /api/session fetch
-const IDLE_TIMEOUT = 60_000; // no SSE line for this long (sliding)
 const MAX_AUTH_RETRIES = 2; // fresh-token attempts after a 401/403
 const MAX_UPSTREAM_MESSAGES = 100; // upstream hard cap; below it "too long" is session accumulation
 const TOO_LONG_MARKER = "conversation is too long";
@@ -54,77 +57,23 @@ export function eventReasoning(ev) {
 export class StreamTruncatedError extends Error {
   constructor() { super("upstream: stream ended before [DONE]"); this.name = "StreamTruncatedError"; }
 }
-export class IdleTimeoutError extends Error {
-  constructor() { super("upstream: stream idle timeout"); this.name = "IdleTimeoutError"; }
-}
-
 // readSSE splits an upstream SSE body into parsed events, invoking onEvent
-// per event, with a sliding idle watchdog (every line, blank separators
-// included, resets it). Resolves when [DONE] arrives; rejects
-// StreamTruncatedError when the body ends cleanly before [DONE] — a truncated
-// answer must be distinguishable from a finished one. Malformed lines are
-// skipped via onMalformed, never fatal.
-export async function readSSE(body, onEvent, { signal, idleMs = IDLE_TIMEOUT, onMalformed } = {}) {
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
-
-  const onLine = (line) => {
+// per event. The watchdog and the byte buffer belong to the shared line pump
+// (lines.mjs); this function is only the SSE reading of a line. Resolves when
+// [DONE] arrives; rejects StreamTruncatedError when the body ends cleanly
+// before [DONE] — a truncated answer must be distinguishable from a finished
+// one. Malformed lines are skipped via onMalformed, never fatal.
+export async function readSSE(body, onEvent, { signal, idleMs = DEFAULT_IDLE_MS, onMalformed } = {}) {
+  const outcome = await pumpLines(body, (line) => {
     if (!line.startsWith("data:")) return;
     const payload = line.slice(5).trim();
     if (!payload) return;
-    if (payload === "[DONE]") return "stop";
+    if (payload === "[DONE]") return STOP;
     const ev = parseEvent(payload);
     if (!ev) { onMalformed?.(payload); return; }
     onEvent(ev);
-  };
-
-  let idleTimer = null;
-  let idleReject = null;
-  const idlePromise = new Promise((_, rej) => { idleReject = rej; });
-  const armIdle = () => {
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => idleReject(new IdleTimeoutError()), idleMs);
-  };
-  idlePromise.catch(() => {}); // no unhandled rejection when the pump wins
-  armIdle();
-
-  // Client abort: stop reading the upstream immediately instead of idling out
-  // (which would hold the upstream connection for up to idleMs after the
-  // caller has gone). The aborted race rejects; finally cancels the reader.
-  const abortPromise = signal
-    ? new Promise((_, rej) => {
-        if (signal.aborted) rej(new Error("aborted"));
-        else signal.addEventListener("abort", () => rej(new Error("aborted")), { once: true });
-      })
-    : null;
-  abortPromise?.catch(() => {});
-
-  try {
-    while (true) {
-      const { value, done: eof } = await Promise.race(
-        abortPromise ? [reader.read(), idlePromise, abortPromise] : [reader.read(), idlePromise],
-      );
-      if (eof) break;
-      armIdle();
-      buf += decoder.decode(value, { stream: true });
-      let idx;
-      let stop = false;
-      while ((idx = buf.indexOf("\n")) >= 0) {
-        let line = buf.slice(0, idx);
-        buf = buf.slice(idx + 1);
-        if (line.endsWith("\r")) line = line.slice(0, -1);
-        if (onLine(line) === "stop") { stop = true; break; }
-      }
-      if (stop) return;
-    }
-    const tail = (buf + decoder.decode()).trim();
-    if (tail && onLine(tail) !== "stop") throw new StreamTruncatedError();
-    if (!tail) throw new StreamTruncatedError();
-  } finally {
-    if (idleTimer) clearTimeout(idleTimer);
-    try { await reader.cancel(); } catch {}
-  }
+  }, { signal, idleMs });
+  if (outcome !== "stopped") throw new StreamTruncatedError();
 }
 
 // streamEvents wraps readSSE as an async iterator of events. The consumer
@@ -310,6 +259,43 @@ export class Client {
         throw e;
       }
       return streamEvents(resp.body, { signal });
+    }
+  }
+
+  // search POSTs /api/search-lab/run and returns the NDJSON Response for the
+  // caller to collect. The retry budget is the plain 401/403 token rotation: a
+  // rejected token is discarded and the identical request replayed at most
+  // MAX_AUTH_RETRIES times. chat() keeps its own loop only because its
+  // too-long switch needs the token's identity; search has no such switch, so
+  // the two never share a body. Every other non-200 throws a typed
+  // UpstreamError carrying the numeric status magpie reads as a refusal (429
+  // especially, with Retry-After attached) — search-lab has no
+  // "conversation too long" and no login state to invalidate.
+  async search(ureq, { signal } = {}) {
+    const body = JSON.stringify(ureq);
+    for (let attempt = 0; ; attempt++) {
+      const token = await this.pool.get();
+      const resp = await this.send("POST", "/api/search-lab/run", body, {
+        signal,
+        extraHeaders: {
+          "x-session-token": token,
+          accept: "application/x-ndjson",
+          // Node/Bun decode brotli themselves, but asking for identity keeps
+          // the body plain for every layer in between (the Go gateway does the
+          // same because it cannot decode br at all).
+          "accept-encoding": "identity",
+        },
+      });
+      if (resp.status === 200) return resp;
+
+      const errBody = await resp.text().catch(() => "");
+      const err = new UpstreamError(resp.status, errBody.slice(0, 4096));
+      const retryAfter = resp.headers.get("retry-after");
+      if (retryAfter) err.retryAfter = retryAfter;
+      if (resp.status !== 401 && resp.status !== 403) throw err;
+      this.pool.discard(token);
+      this.pool.replenish();
+      if (attempt >= MAX_AUTH_RETRIES) throw err;
     }
   }
 }

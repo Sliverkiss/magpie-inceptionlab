@@ -1,6 +1,6 @@
 {
   "name": "inceptionlab",
-  "version": "0.2.2",
+  "version": "0.4.0",
   "description": "Inception Mercury (chat.inceptionlabs.ai) provider plugin for magpie / OpenCode: anonymous diffusion-LLM access with Vercel-checkpoint clearance, reasoning passthrough, native web-search citations and full tool-call bridging.",
   "type": "module",
   "main": "./index.mjs",

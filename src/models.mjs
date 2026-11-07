@@ -24,6 +24,17 @@ export function toStaticModel(m) {
     limit: { context: m.context, output: m.output },
     reasoning: true,
     tool_call: true,
+    // searches: the model answers web_search itself, so magpie hands it a
+    // client's web_search as sent instead of searching first. Note the limit
+    // the chat body sets: webSearchEnabled is a manifest's null check, so the
+    // upstream searches by itself only when the request carries no tool
+    // manifest — with tools declared it runs its own server-side search off.
+    // The flag takes this model off magpie's search path; it does not promise
+    // magpie's own provider picks the search up, since searchRank is a
+    // ranking and a lower-ranked provider can still serve it. The plugin also
+    // registers a `search` hook: this is the model-side half of the same
+    // fact, not a duplicate.
+    searches: true,
     // Text-only: the upstream web client accepts no image parts.
     modalities: { input: ["text"], output: ["text"] },
     attachment: false,

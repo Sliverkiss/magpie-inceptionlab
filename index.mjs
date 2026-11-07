@@ -26,6 +26,7 @@ import * as up from "./src/upstream.mjs";
 import { Client } from "./src/upstream.mjs";
 import { handleChat, setClient, errorResponse } from "./src/chat.mjs";
 import { STATIC_MODELS, toStaticModel, buildModelMap } from "./src/models.mjs";
+import { searchInception, collectSearch, buildSearchRequest, normalizeSources } from "./src/search.mjs";
 
 const PROVIDER = "inceptionlab";
 
@@ -122,6 +123,26 @@ export const InceptionlabPlugin = async () => {
       },
     },
 
+    // Web search API (magpie's `search` hook): the search-lab pipeline behind
+    // the same anonymous clearance + session the chat path uses, so a client's
+    // own WebSearch is answered with real ranked pages. The run's grounded
+    // synthesis is dropped at this boundary — plugin.SearchPage has no `text`
+    // field — see the note in src/search.mjs.
+    //
+    // keyOptional — not `auth` — because there is no account to bind: the
+    // clearance cookie and session token live in the module-level Client, and
+    // `auth: "inceptionlab"` would make the host demand a signed-in account
+    // and route the call through its refresh path for credentials this plugin
+    // never stores. url/keysURL are absent for the same reason (no key, no
+    // signup page).
+    search: {
+      inceptionlab: {
+        name: "Inception Mercury",
+        keyOptional: true,
+        execute: (inputs, ctx) => searchInception(inputs, client, { signal: ctx?.abort }),
+      },
+    },
+
     // Static catalog: the upstream publishes no models endpoint. Never empty.
     provider: {
       id: PROVIDER,
@@ -134,4 +155,5 @@ export const InceptionlabPlugin = async () => {
 
 export const _internal = {
   PROVIDER, BASE: up.BASE, STATIC_MODELS, buildModelMap, handleChat, setClient, errorResponse,
+  searchInception, collectSearch, buildSearchRequest, normalizeSources,
 };
